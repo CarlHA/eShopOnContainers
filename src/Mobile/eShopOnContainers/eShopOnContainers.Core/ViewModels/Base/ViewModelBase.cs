@@ -34,7 +34,7 @@ namespace eShopOnContainers.Core.ViewModels.Base
 
         public virtual Task InitializeAsync(object navigationData)
         {
-             return Task.FromResult(false);
+            return Task.FromResult(false);
         }
     }
 }

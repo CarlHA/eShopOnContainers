@@ -76,7 +76,9 @@ namespace eShopOnContainers.Core.ViewModels
 
             if (basket != null && basket.Items != null && basket.Items.Any())
             {
+                BadgeCount = 0;
                 BasketItems.Clear();
+
                 foreach (var basketItem in basket.Items)
                 {
                     BadgeCount += basketItem.Quantity;
@@ -84,8 +86,8 @@ namespace eShopOnContainers.Core.ViewModels
                 }
             }
 
-            MessagingCenter.Unsubscribe<CatalogViewModel, CatalogItem>(this, MessengerKeys.AddProduct);
-            MessagingCenter.Subscribe<CatalogViewModel, CatalogItem>(this, MessengerKeys.AddProduct, async (sender, arg) =>
+            MessagingCenter.Unsubscribe<CatalogViewModel, CatalogItem>(this, MessageKeys.AddProduct);
+            MessagingCenter.Subscribe<CatalogViewModel, CatalogItem>(this, MessageKeys.AddProduct, async (sender, arg) =>
             {
                 BadgeCount++;
 
@@ -106,23 +108,26 @@ namespace eShopOnContainers.Core.ViewModels
                 Quantity = 1
             });
 
-            await ReCalculateTotal();
+            await ReCalculateTotalAsync();
         }
 
         private async Task AddItemAsync(BasketItem item)
         {
             BadgeCount++;
+
             await AddBasketItemAsync(item);
+
             RaisePropertyChanged(() => BasketItems);
         }
 
         private async Task AddBasketItemAsync(BasketItem item)
         {
             BasketItems.Add(item);
-            await ReCalculateTotal();
+
+            await ReCalculateTotalAsync();
         }
 
-        private async Task ReCalculateTotal()
+        private async Task ReCalculateTotalAsync()
         {
             Total = 0;
 

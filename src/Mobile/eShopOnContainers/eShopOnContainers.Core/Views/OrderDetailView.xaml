@@ -6,7 +6,7 @@
              xmlns:templates="clr-namespace:eShopOnContainers.Core.Views.Templates;assembly=eShopOnContainers.Core"   
              xmlns:animations="clr-namespace:eShopOnContainers.Core.Animations;assembly=eShopOnContainers.Core"
              xmlns:triggers="clr-namespace:eShopOnContainers.Core.Triggers;assembly=eShopOnContainers.Core"
-		     viewModelBase:ViewModelLocator.AutoWireViewModel="true"
+			 viewModelBase:ViewModelLocator.AutoWireViewModel="true"
              Title="{Binding Order.OrderNumber}">
     <ContentPage.Resources>
         <ResourceDictionary>

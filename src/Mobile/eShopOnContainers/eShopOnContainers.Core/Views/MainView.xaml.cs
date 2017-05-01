@@ -15,7 +15,7 @@ namespace eShopOnContainers.Core.Views
         {
             base.OnAppearing();
 
-            MessagingCenter.Subscribe<MainViewModel, int>(this, MessengerKeys.ChangeTab, (sender, arg) =>
+            MessagingCenter.Subscribe<MainViewModel, int>(this, MessageKeys.ChangeTab, (sender, arg) =>
             {
                switch(arg)
                 {
@@ -34,6 +34,17 @@ namespace eShopOnContainers.Core.Views
 			await ((CatalogViewModel)HomeView.BindingContext).InitializeAsync(null);
 			await ((BasketViewModel)BasketView.BindingContext).InitializeAsync(null);
 			await ((ProfileViewModel)ProfileView.BindingContext).InitializeAsync(null);
+        }
+
+        protected override async void OnCurrentPageChanged()
+        {
+            base.OnCurrentPageChanged();
+
+            if (CurrentPage is BasketView)
+            {
+                // Force basket view refresh every time we access it
+                await (BasketView.BindingContext as ViewModelBase).InitializeAsync(null);
+            }
         }
     }
 }

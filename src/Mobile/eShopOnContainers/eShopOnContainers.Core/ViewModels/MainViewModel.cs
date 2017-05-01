@@ -2,7 +2,6 @@
 using eShopOnContainers.Core.ViewModels.Base;
 using eShopOnContainers.Core.Models.Navigation;
 using Xamarin.Forms;
-using eShopOnContainers.Core.ViewModels.Base;
 using System.Windows.Input;
 
 namespace eShopOnContainers.Core.ViewModels
@@ -19,7 +18,7 @@ namespace eShopOnContainers.Core.ViewModels
             {
                 // Change selected application tab
                 var tabIndex = ((TabParameter)navigationData).TabIndex;
-                MessagingCenter.Send(this, MessengerKeys.ChangeTab, tabIndex);
+                MessagingCenter.Send(this, MessageKeys.ChangeTab, tabIndex);
             }
 
             return base.InitializeAsync(navigationData);

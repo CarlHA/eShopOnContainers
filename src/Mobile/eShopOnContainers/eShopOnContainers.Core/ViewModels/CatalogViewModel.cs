@@ -5,8 +5,6 @@ using Xamarin.Forms;
 using eShopOnContainers.Core.Models.Catalog;
 using eShopOnContainers.Core.Services.Catalog;
 using System.Windows.Input;
-using eShopOnContainers.Core.Services.Basket;
-using eShopOnContainers.Core.Services.User;
 
 namespace eShopOnContainers.Core.ViewModels
 {
@@ -17,19 +15,11 @@ namespace eShopOnContainers.Core.ViewModels
         private CatalogBrand _brand;
         private ObservableCollection<CatalogType> _types;
         private CatalogType _type;
-
-        private IBasketService _basketService;
         private ICatalogService _productsService;
-        private IUserService _userService;
 
-        public CatalogViewModel(
-            IBasketService basketService,
-            ICatalogService productsService,
-            IUserService userService)
+        public CatalogViewModel(ICatalogService productsService)
         {
-            _basketService = basketService;
             _productsService = productsService;
-            _userService = userService;
         }
 
         public ObservableCollection<CatalogItem> Products
@@ -107,7 +97,7 @@ namespace eShopOnContainers.Core.ViewModels
         private void AddCatalogItem(CatalogItem catalogItem)
         {
             // Add new item to Basket
-            MessagingCenter.Send(this, MessengerKeys.AddProduct, catalogItem);
+            MessagingCenter.Send(this, MessageKeys.AddProduct, catalogItem);
         }
 
         private async Task FilterAsync()
@@ -120,7 +110,7 @@ namespace eShopOnContainers.Core.ViewModels
             IsBusy = true;
 
             // Filter catalog products
-            MessagingCenter.Send(this, MessengerKeys.Filter);
+            MessagingCenter.Send(this, MessageKeys.Filter);
             Products = await _productsService.FilterAsync(Brand.Id, Type.Id);
 
             IsBusy = false;
