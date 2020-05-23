@@ -1,17 +1,18 @@
-﻿using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Abstractions;
+﻿using Autofac;
+using Microsoft.eShopOnContainers.BuildingBlocks.EventBus;
+using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Abstractions;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Events;
+using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Extensions;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Polly;
 using Polly.Retry;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using RabbitMQ.Client.Exceptions;
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Net.Sockets;
-using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -21,131 +22,152 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
     {
         const string BROKER_NAME = "eshop_event_bus";
 
-        private readonly IRabbitMQPersisterConnection _persisterConnection;
+        private readonly IRabbitMQPersistentConnection _persistentConnection;
         private readonly ILogger<EventBusRabbitMQ> _logger;
-
-        private readonly Dictionary<string, List<IIntegrationEventHandler>> _handlers
-            = new Dictionary<string, List<IIntegrationEventHandler>>();
-
-        private readonly List<Type> _eventTypes
-            = new List<Type>();
+        private readonly IEventBusSubscriptionsManager _subsManager;
+        private readonly ILifetimeScope _autofac;
+        private readonly string AUTOFAC_SCOPE_NAME = "eshop_event_bus";
+        private readonly int _retryCount;
 
         private IModel _consumerChannel;
         private string _queueName;
 
-        public EventBusRabbitMQ(IRabbitMQPersisterConnection persisterConnection, ILogger<EventBusRabbitMQ> logger)
+        public EventBusRabbitMQ(IRabbitMQPersistentConnection persistentConnection, ILogger<EventBusRabbitMQ> logger,
+            ILifetimeScope autofac, IEventBusSubscriptionsManager subsManager, string queueName = null, int retryCount = 5)
         {
-            _persisterConnection = persisterConnection ?? throw new ArgumentNullException(nameof(persisterConnection));
+            _persistentConnection = persistentConnection ?? throw new ArgumentNullException(nameof(persistentConnection));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-
+            _subsManager = subsManager ?? new InMemoryEventBusSubscriptionsManager();
+            _queueName = queueName;
             _consumerChannel = CreateConsumerChannel();
+            _autofac = autofac;
+            _retryCount = retryCount;
+            _subsManager.OnEventRemoved += SubsManager_OnEventRemoved;
         }
 
+        private void SubsManager_OnEventRemoved(object sender, string eventName)
+        {
+            if (!_persistentConnection.IsConnected)
+            {
+                _persistentConnection.TryConnect();
+            }
+
+            using (var channel = _persistentConnection.CreateModel())
+            {
+                channel.QueueUnbind(queue: _queueName,
+                    exchange: BROKER_NAME,
+                    routingKey: eventName);
+
+                if (_subsManager.IsEmpty)
+                {
+                    _queueName = string.Empty;
+                    _consumerChannel.Close();
+                }
+            }
+        }
 
         public void Publish(IntegrationEvent @event)
         {
-            if (!_persisterConnection.IsConnected)
+            if (!_persistentConnection.IsConnected)
             {
-                _persisterConnection.TryConnect();
+                _persistentConnection.TryConnect();
             }
 
             var policy = RetryPolicy.Handle<BrokerUnreachableException>()
                 .Or<SocketException>()
-                .WaitAndRetry(5, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), (ex, time) =>
+                .WaitAndRetry(_retryCount, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), (ex, time) =>
                 {
-                    _logger.LogWarning(ex.ToString());
+                    _logger.LogWarning(ex, "Could not publish event: {EventId} after {Timeout}s ({ExceptionMessage})", @event.Id, $"{time.TotalSeconds:n1}", ex.Message);
                 });
 
-            using (var channel = _persisterConnection.CreateModel())
-            {
-                var eventName = @event.GetType()
-                    .Name;
+            var eventName = @event.GetType().Name;
 
-                channel.ExchangeDeclare(exchange: BROKER_NAME,
-                                    type: "direct");
+            _logger.LogTrace("Creating RabbitMQ channel to publish event: {EventId} ({EventName})", @event.Id, eventName);
+
+            using (var channel = _persistentConnection.CreateModel())
+            {
+
+                _logger.LogTrace("Declaring RabbitMQ exchange to publish event: {EventId}", @event.Id);
+
+                channel.ExchangeDeclare(exchange: BROKER_NAME, type: "direct");
 
                 var message = JsonConvert.SerializeObject(@event);
                 var body = Encoding.UTF8.GetBytes(message);
 
                 policy.Execute(() =>
                 {
-                    channel.BasicPublish(exchange: BROKER_NAME,
-                                     routingKey: eventName,
-                                     basicProperties: null,
-                                     body: body);
+                    var properties = channel.CreateBasicProperties();
+                    properties.DeliveryMode = 2; // persistent
+
+                    _logger.LogTrace("Publishing event to RabbitMQ: {EventId}", @event.Id);
+
+                    channel.BasicPublish(
+                        exchange: BROKER_NAME,
+                        routingKey: eventName,
+                        mandatory: true,
+                        basicProperties: properties,
+                        body: body);
                 });
             }
         }
 
-        public void Subscribe<T>(IIntegrationEventHandler<T> handler) where T : IntegrationEvent
+        public void SubscribeDynamic<TH>(string eventName)
+            where TH : IDynamicIntegrationEventHandler
         {
-            var eventName = typeof(T).Name;
+            _logger.LogInformation("Subscribing to dynamic event {EventName} with {EventHandler}", eventName, typeof(TH).GetGenericTypeName());
 
-            if (_handlers.ContainsKey(eventName))
+            DoInternalSubscription(eventName);
+            _subsManager.AddDynamicSubscription<TH>(eventName);
+            StartBasicConsume();
+        }
+
+        public void Subscribe<T, TH>()
+            where T : IntegrationEvent
+            where TH : IIntegrationEventHandler<T>
+        {
+            var eventName = _subsManager.GetEventKey<T>();
+            DoInternalSubscription(eventName);
+
+            _logger.LogInformation("Subscribing to event {EventName} with {EventHandler}", eventName, typeof(TH).GetGenericTypeName());
+
+            _subsManager.AddSubscription<T, TH>();
+            StartBasicConsume();
+        }
+
+        private void DoInternalSubscription(string eventName)
+        {
+            var containsKey = _subsManager.HasSubscriptionsForEvent(eventName);
+            if (!containsKey)
             {
-                _handlers[eventName].Add(handler);
-            }
-            else
-            {
-                if (!_persisterConnection.IsConnected)
+                if (!_persistentConnection.IsConnected)
                 {
-                    _persisterConnection.TryConnect();
+                    _persistentConnection.TryConnect();
                 }
 
-                using (var channel = _persisterConnection.CreateModel())
+                using (var channel = _persistentConnection.CreateModel())
                 {
                     channel.QueueBind(queue: _queueName,
                                       exchange: BROKER_NAME,
                                       routingKey: eventName);
-
-                    _handlers.Add(eventName, new List<IIntegrationEventHandler>());
-                    _handlers[eventName].Add(handler);
-                    _eventTypes.Add(typeof(T));
                 }
-
             }
-
         }
 
-        public void Unsubscribe<T>(IIntegrationEventHandler<T> handler) where T : IntegrationEvent
+        public void Unsubscribe<T, TH>()
+            where T : IntegrationEvent
+            where TH : IIntegrationEventHandler<T>
         {
-            var eventName = typeof(T).Name;
+            var eventName = _subsManager.GetEventKey<T>();
 
-            if (_handlers.ContainsKey(eventName) && _handlers[eventName].Contains(handler))
-            {
-                _handlers[eventName].Remove(handler);
+            _logger.LogInformation("Unsubscribing from event {EventName}", eventName);
 
-                if (_handlers[eventName].Count == 0)
-                {
-                    _handlers.Remove(eventName);
+            _subsManager.RemoveSubscription<T, TH>();
+        }
 
-                    var eventType = _eventTypes.SingleOrDefault(e => e.Name == eventName);
-
-                    if (eventType != null)
-                    {
-                        _eventTypes.Remove(eventType);
-
-                        if (!_persisterConnection.IsConnected)
-                        {
-                            _persisterConnection.TryConnect();
-                        }
-
-                        using (var channel = _persisterConnection.CreateModel())
-                        {
-                            channel.QueueUnbind(queue: _queueName,
-                                exchange: BROKER_NAME,
-                                routingKey: eventName);
-
-                            if (_handlers.Keys.Count == 0)
-                            {
-                                _queueName = string.Empty;
-
-                                _consumerChannel.Close();
-                            }
-                        }
-                    }
-                }
-            }
+        public void UnsubscribeDynamic<TH>(string eventName)
+            where TH : IDynamicIntegrationEventHandler
+        {
+            _subsManager.RemoveDynamicSubscription<TH>(eventName);
         }
 
         public void Dispose()
@@ -154,41 +176,83 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
             {
                 _consumerChannel.Dispose();
             }
-            
-            _handlers.Clear();
+
+            _subsManager.Clear();
+        }
+
+        private void StartBasicConsume()
+        {
+            _logger.LogTrace("Starting RabbitMQ basic consume");
+
+            if (_consumerChannel != null)
+            {
+                var consumer = new AsyncEventingBasicConsumer(_consumerChannel);
+
+                consumer.Received += Consumer_Received;
+
+                _consumerChannel.BasicConsume(
+                    queue: _queueName,
+                    autoAck: false,
+                    consumer: consumer);
+            }
+            else
+            {
+                _logger.LogError("StartBasicConsume can't call on _consumerChannel == null");
+            }
+        }
+
+        private async Task Consumer_Received(object sender, BasicDeliverEventArgs eventArgs)
+        {
+            var eventName = eventArgs.RoutingKey;
+            var message = Encoding.UTF8.GetString(eventArgs.Body);
+
+            try
+            {
+                if (message.ToLowerInvariant().Contains("throw-fake-exception"))
+                {
+                    throw new InvalidOperationException($"Fake exception requested: \"{message}\"");
+                }
+
+                await ProcessEvent(eventName, message);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "----- ERROR Processing message \"{Message}\"", message);
+            }
+
+            // Even on exception we take the message off the queue.
+            // in a REAL WORLD app this should be handled with a Dead Letter Exchange (DLX). 
+            // For more information see: https://www.rabbitmq.com/dlx.html
+            _consumerChannel.BasicAck(eventArgs.DeliveryTag, multiple: false);
         }
 
         private IModel CreateConsumerChannel()
         {
-            if (!_persisterConnection.IsConnected)
+            if (!_persistentConnection.IsConnected)
             {
-                _persisterConnection.TryConnect();
+                _persistentConnection.TryConnect();
             }
 
-            var channel = _persisterConnection.CreateModel();
+            _logger.LogTrace("Creating RabbitMQ consumer channel");
+
+            var channel = _persistentConnection.CreateModel();
 
             channel.ExchangeDeclare(exchange: BROKER_NAME,
-                                 type: "direct");
+                                    type: "direct");
 
-            _queueName = channel.QueueDeclare().QueueName;
-
-            var consumer = new EventingBasicConsumer(channel);
-            consumer.Received += async (model, ea) =>
-            {
-                var eventName = ea.RoutingKey;
-                var message = Encoding.UTF8.GetString(ea.Body);
-
-                await ProcessEvent(eventName, message);
-            };
-
-            channel.BasicConsume(queue: _queueName,
-                                 noAck: true,
-                                 consumer: consumer);
+            channel.QueueDeclare(queue: _queueName,
+                                 durable: true,
+                                 exclusive: false,
+                                 autoDelete: false,
+                                 arguments: null);
 
             channel.CallbackException += (sender, ea) =>
             {
+                _logger.LogWarning(ea.Exception, "Recreating RabbitMQ consumer channel");
+
                 _consumerChannel.Dispose();
                 _consumerChannel = CreateConsumerChannel();
+                StartBasicConsume();
             };
 
             return channel;
@@ -196,17 +260,41 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
 
         private async Task ProcessEvent(string eventName, string message)
         {
-            if (_handlers.ContainsKey(eventName))
-            {
-                Type eventType = _eventTypes.Single(t => t.Name == eventName);
-                var integrationEvent = JsonConvert.DeserializeObject(message, eventType);
-                var concreteType = typeof(IIntegrationEventHandler<>).MakeGenericType(eventType);
-                var handlers = _handlers[eventName];
+            _logger.LogTrace("Processing RabbitMQ event: {EventName}", eventName);
 
-                foreach (var handler in handlers)
+            if (_subsManager.HasSubscriptionsForEvent(eventName))
+            {
+                using (var scope = _autofac.BeginLifetimeScope(AUTOFAC_SCOPE_NAME))
                 {
-                    await (Task)concreteType.GetMethod("Handle").Invoke(handler, new object[] { integrationEvent });
+                    var subscriptions = _subsManager.GetHandlersForEvent(eventName);
+                    foreach (var subscription in subscriptions)
+                    {
+                        if (subscription.IsDynamic)
+                        {
+                            var handler = scope.ResolveOptional(subscription.HandlerType) as IDynamicIntegrationEventHandler;
+                            if (handler == null) continue;
+                            dynamic eventData = JObject.Parse(message);
+
+                            await Task.Yield();
+                            await handler.Handle(eventData);
+                        }
+                        else
+                        {
+                            var handler = scope.ResolveOptional(subscription.HandlerType);
+                            if (handler == null) continue;
+                            var eventType = _subsManager.GetEventTypeByName(eventName);
+                            var integrationEvent = JsonConvert.DeserializeObject(message, eventType);
+                            var concreteType = typeof(IIntegrationEventHandler<>).MakeGenericType(eventType);
+
+                            await Task.Yield();
+                            await (Task)concreteType.GetMethod("Handle").Invoke(handler, new object[] { integrationEvent });
+                        }
+                    }
                 }
+            }
+            else
+            {
+                _logger.LogWarning("No subscription for RabbitMQ event: {EventName}", eventName);
             }
         }
     }
